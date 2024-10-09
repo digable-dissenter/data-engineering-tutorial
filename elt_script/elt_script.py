@@ -1,7 +1,15 @@
+import logging
+import os
 import subprocess
 import time
 
-def wait_for_postgres(host, max_retries=5, delay_seconds=5):
+# Configure logging
+logging.basicConfig(filename='/app/logs/elt_script.log', 
+                    level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+def wait_for_postgres(host, max_retries=5, base_delay_seconds=1):
     """Wait for PostgreSQL to become available."""
     retries = 0
     while retries < max_retries:
@@ -10,41 +18,48 @@ def wait_for_postgres(host, max_retries=5, delay_seconds=5):
                 ["pg_isready", "-h", host], check=True, capture_output=True, text=True
             )
             if "accepting connections" in result.stdout:
-                print("Successfully connected to PostgreSQL!")
+                logging.info("Successfully connected to {host}!")
                 return True
         except subprocess.CalledProcessError as e:
-            print(f"Error connecting to PostgreSQL: {e}")
             retries += 1
-            print(
-                f"Retrying in {delay_seconds} seconds... (Attempt {retries}/{max_retries})"
+            wait_time = base_delay_seconds * (2 ** retries)
+            logging.warning(f"Error connecting to {host}: {e}. Retrying in {wait_time} seconds...")
+            
+            logging.info(
+                f"Retrying in {wait_time} seconds... (Attempt {retries}/{max_retries})"
             )
-            time.sleep(delay_seconds)
-    print("Max retries reached. \nFailed to connect to PostgreSQL within the specified timeout. \nExiting...")
+            time.sleep(wait_time)
+    logging.error("Max retries reached. \nFailed to connect to {host} within the specified timeout. \nExiting...")
     return False
 
-# Use the function before running the ELT process
-if not wait_for_postgres(host="source_postgres"):
-    exit(1)
-
-print("Starting ELT process...")
-
+# Get environment vvariables for the source and destination databases
 # Configuration for the source PostgreSQL database
 source_config = {
-    'dbname': 'source_db',
-    'user': 'postgres',
-    'password': 'secret',
-    # Use the service name from docker-compose as the hostname
-    'host': 'source_postgres',
+    'host': os.getenv('SOURCE_DB_HOST'),
+    'user': os.getenv('SOURCE_DB_USER'),
+    'password': os.getenv('SOURCE_DB_PASSWORD'),
+    'dbname': os.getenv('SOURCE_DB_NAME')
 }
 
 # Configuration for the destination PostgreSQL database
 destination_config = {
-    'dbname': 'destination_db',
-    'user': 'postgres',
-    'password': 'secret',
-    # Use the service name from docker-compose as the hostname
-    'host': 'destination_db',
+    #'host': os.getenv('DEST_DB_HOST'),
+    'host': 'destination_postgres',
+    'user': os.getenv('DEST_DB_USER', 'postgres'),
+    'password': os.getenv('DEST_DB_PASSWORD', 'secret'),
+    'dbname': os.getenv('DEST_DB_NAME', 'destination_db')
 }
+
+# Use the function before running the ELT process
+if not wait_for_postgres(host=source_config['host']):
+    logging.error("Failed to connect to source database. Exiting...")
+    exit(1)
+    
+if not wait_for_postgres(host=destination_config['host']):
+    logging.error("Failed to connect to destination database. Exiting...")
+    exit(1)
+
+logging.info("Starting ELT process...")
 
 # Use pg_dump to dump the source database to a SQL file
 dump_command = [
@@ -56,11 +71,15 @@ dump_command = [
     '-w'  # Do not prompt for password
 ]
 
-# Set the PGPASSWORD environment variable to avoid password prompt
-subprocess_env = dict(PGPASSWORD=source_config['password'])
-
-# Execute the dump command
-subprocess.run(dump_command, env=subprocess_env, check=True)
+try:
+    # Set the PGPASSWORD environment variable to avoid password prompt
+    subprocess_env = dict(PGPASSWORD=source_config['password'])
+    # Execute the dump command
+    subprocess.run(dump_command, env=subprocess_env, check=True)
+    logging.info("Data successfully dumped from source database.")
+except:
+    logging.error(f"Failed to dump data from source database.")
+    exit(1)
 
 # Use psql to load the dumped SQL file into the destination database
 load_command = [
@@ -71,10 +90,23 @@ load_command = [
     '-a', '-f', 'data_dump.sql'
 ]
 
-# Set the PGPASSWORD environment variable for the destination database
-subprocess_env = dict(PGPASSWORD=destination_config['password'])
+try:
+    # Set the PGPASSWORD environment variable for the destination database
+    subprocess_env = dict(PGPASSWORD=destination_config['password'])
+    # Execute the load command
+    subprocess.run(load_command, env=subprocess_env, check=True)
+    logging.info("Data successfully loaded into destination database.")
+except subprocess.CalledProcessError as e:
+    logging.error(f"Failed to load data into destination database. Command: {e.command}, Return code: {e.returncode}")
+    logging.error(f"Command output: {e.output}")
+    exit(1)
 
-# Execute the load command
-subprocess.run(load_command, env=subprocess_env, check=True)
+# Remove the dump file after successful load
+try:
+    os.remove('data_dump.sql')
+    logging.info("Intermediate dump file removed successfully.")
+except OSError as e:
+    logging.error(f"Failed to remove dump file. {e}")
+    exit(1)
 
-print("Ending ELT script...")
+logging.info("Ending ELT script...")
